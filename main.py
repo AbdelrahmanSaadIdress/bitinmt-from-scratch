@@ -275,7 +275,7 @@ def main(cfg: DictConfig) -> None:
         raw_files = collect_raw_text_for_sp(
             config,
             raw_dir=raw_dir,
-            max_examples_per_pair=max_examples or 500_000,
+            max_examples_per_pair=max_examples ,
         )
 
         tokenizer = MultilingualTokenizer.train(
