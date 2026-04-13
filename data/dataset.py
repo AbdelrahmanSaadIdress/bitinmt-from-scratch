@@ -146,7 +146,6 @@ def load_opus_pairs(
         raise ImportError(
             "Install the 'datasets' package: pip install datasets"
         ) from exc
-
     # OPUS-100 config name format: "{lang1}-{lang2}" (alphabetical order)
     lang_pair = "-".join(sorted([src_lang, tgt_lang]))
     logger.info("Loading OPUS-100 [%s] split=%s ...", lang_pair, split)
@@ -154,33 +153,30 @@ def load_opus_pairs(
     ds = load_dataset(
         "Helsinki-NLP/opus-100",
         lang_pair,
-        split=split,
+        split="train",
         cache_dir=cache_dir,
-        trust_remote_code=True,
     )
     
-    if max_examples is not None:
+    if max_examples is not None and ratios is None:
         ds = ds.select(range(min(max_examples, len(ds))))
 
     if ratios is not None:
         if len(ratios) != 3:
             raise ValueError("ratios must be [train_ratio, val_ratio, test_ratio]")
-
-        ds = ds.shuffle(seed=42)
-
-        split_size = len(ds)
+        ds = ds.shuffle(seed=42)  # Shuffle before splitting to ensure randomness
+        train_end = int(ratios[0] * max_examples)                          # 700
+        val_end   = train_end + int(ratios[1] * max_examples)              # 700 + 300 = 1000 (but ratios[1] should be 0.2 → 900)
+        test_end  = val_end   + int(ratios[2] * max_examples)              # 900 + 100 = 1000
 
         if split == "train":
-            ds = ds.select(range(int(ratios[0] * split_size)))
-
+            ds = ds.select(range(0, train_end))
         elif split == "validation":
-            ds = ds.select(range(int(ratios[1] * split_size)))
-
+            ds = ds.select(range(train_end, val_end))
         elif split == "test":
-            ds = ds.select(range(int(ratios[2] * split_size)))
-
+            ds = ds.select(range(val_end,   test_end))
         else:
             raise ValueError(f"Invalid split: {split}")
+
 
     # OPUS stores both sides under ds["translation"][lang_code]
     raw: List[Tuple[str, str, str, str]] = []
@@ -191,10 +187,8 @@ def load_opus_pairs(
             raw.append((s, t, src_lang, tgt_lang))
             if also_reverse:
                 raw.append((t, s, tgt_lang, src_lang))
-
     logger.info("Loaded %d sentence pairs (incl. reverse=%s)", len(raw), also_reverse)
     return raw
-
 
 def tokenise_pairs(
     raw_pairs: List[Tuple[str, str, str, str]],
