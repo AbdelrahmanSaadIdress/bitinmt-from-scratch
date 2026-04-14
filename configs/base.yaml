@@ -26,7 +26,7 @@ Data:
   sp_model_path: data/spm/multinmt.model         # trained SentencePiece model
 
   # SentencePiece training
-  vocab_size:     3200                           # shared BPE vocab across all langs
+  vocab_size:     16000                           # shared BPE vocab across all langs
   character_coverage: 0.9995                      # ~1.0 for Latin, 0.9995 covers Arabic
   sp_model_type: bpe                              # byte-pair encoding (paper default)
 
@@ -48,7 +48,7 @@ Data:
   # Override at CLI: python main.py Data.max_examples=1000
   max_examples: 200000         #100 000  #500 000    #1 000 000
 
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------   
 # Modelling  (paper Table 3, "base" column)
 # ---------------------------------------------------------------------------
 Modelling:
@@ -82,21 +82,21 @@ Training:
                                # set lower if VRAM is limited; trainer will accumulate
   grad_accum_steps: 4          # increase to simulate larger batch on small GPU
 
-  max_epochs:      20
-  max_steps:    25000         # hard stop regardless of epochs
+  max_epochs:      40
+  max_steps:    2000000000         # hard stop regardless of epochs
 
   # Mixed precision — "beyond the paper" speedup, harmless to faithfulness
   use_amp:        true         # torch.cuda.amp  (set false on CPU / MPS)
 
   # Checkpointing
   checkpoint_dir:   checkpoints/
-  save_every_n_epochs:  5
+  save_every_n_epochs:  2
   keep_last_n_checkpoints: 3   # rolling window to save disk space
   save_best_bleu:   true       # always keep the best-BLEU checkpoint
 
   # Logging / eval cadence
   log_every_n_steps:    100
-  eval_every_n_epochs:    2
+  eval_every_n_epochs:    1
   seed:                  42
 
 # ---------------------------------------------------------------------------

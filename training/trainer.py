@@ -444,7 +444,7 @@ class Trainer:
         """
         # Cap so validation never takes longer than a fraction of training time.
         # 200 batches gives a stable corpus BLEU estimate; increase for final eval.
-        MAX_VAL_BATCHES = 200
+        MAX_VAL_BATCHES = 500
 
         self.model.eval()
         hyp_by_pair: Dict[str, list] = {}
