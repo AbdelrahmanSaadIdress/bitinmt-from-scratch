@@ -12,6 +12,25 @@ Covers (in order of execution):
     • Wandb logging: loss, LR, BLEU per language pair, attention heatmaps
     • Per-epoch validation with BLEU evaluation via sacrebleu
 
+Two checkpoint-loading modes
+-----------------------------
+    resume_from    (Path | None)
+        Full resume: restores model weights, optimizer state, scheduler
+        state, global_step, epoch, and best_bleu.  Training continues
+        exactly where it left off — the LR curve is unbroken.
+        Use this after a crash or pre-emption.
+
+    warm_start_from (Path | None)
+        Weights-only warm start: loads model weights from a previous run
+        but resets *all* training state (step=0, epoch=0, fresh optimizer,
+        fresh Noam schedule, best_bleu=0).  Training restarts from scratch
+        with the pre-trained weights as the initial point.
+        Use this to:
+            • Fine-tune on a new language pair
+            • Resume with a different learning-rate schedule
+            • Experiment with a different batch size / optimizer config
+            • Add new language tags and continue from a strong baseline
+
 Paper references:
     Optimizer:  Section 5.3 — Adam β₁=0.9, β₂=0.98, ε=1e-9
     Regularisation: Section 5.4 — dropout=0.1, label smoothing ε=0.1
@@ -125,6 +144,89 @@ def load_checkpoint(
     return ckpt["global_step"], ckpt["epoch"], ckpt["best_bleu"]
 
 
+def load_weights_only(
+    path:   Path,
+    model:  Transformer,
+    device: str = "cpu",
+    strict: bool = True,
+) -> dict:
+    """
+    Load *only* the model weights from a checkpoint file, discarding all
+    training state (optimizer, scheduler, step counter, epoch, best_bleu).
+
+    This is the correct function to call when you want a **warm start**:
+    you inherit the learned representations but begin a completely fresh
+    training run with a new LR schedule, optimizer state, and epoch counter.
+
+    Why not just call load_checkpoint with optimizer=None?
+        load_checkpoint still returns (global_step, epoch, best_bleu) which
+        would mislead the trainer into thinking it is mid-run.  This function
+        makes the intent explicit and returns the source checkpoint's config
+        for reference / sanity-checking only — nothing is applied.
+
+    Parameters
+    ----------
+    path   : Path         Path to a `.pt` checkpoint file.
+    model  : Transformer  Will receive the saved weights in-place.
+    device : str          Device to map tensors to while loading.
+    strict : bool         If True (default), the state-dict keys must match
+                          exactly.  Set False if you have added new layers
+                          (e.g. a new language embedding) and want to load
+                          only the matching subset — missing keys will be
+                          randomly initialised.
+
+    Returns
+    -------
+    dict   The config that was stored inside the checkpoint, so the caller
+           can log it or assert that vocab sizes are compatible.
+
+    Raises
+    ------
+    FileNotFoundError  if `path` does not exist.
+    KeyError           if the file has no 'model_state' key (not a valid
+                       checkpoint from this project).
+    RuntimeError       if strict=True and the state-dict keys don't match
+                       (forwarded from PyTorch's load_state_dict).
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"Warm-start checkpoint not found: {path}")
+
+    ckpt = torch.load(path, map_location=device)
+
+    if "model_state" not in ckpt:
+        raise KeyError(
+            f"'{path}' does not contain a 'model_state' key. "
+            "Is this a valid checkpoint from this project?"
+        )
+
+    missing, unexpected = model.load_state_dict(ckpt["model_state"], strict=strict)
+
+    if missing:
+        logger.warning(
+            "Warm start — %d keys NOT found in checkpoint (will use random init): %s",
+            len(missing), missing,
+        )
+    if unexpected:
+        logger.warning(
+            "Warm start — %d keys in checkpoint NOT in current model (ignored): %s",
+            len(unexpected), unexpected,
+        )
+
+    src_config = ckpt.get("config", {})
+    src_step   = ckpt.get("global_step", "?")
+    src_epoch  = ckpt.get("epoch", "?")
+    src_bleu   = ckpt.get("best_bleu", 0.0)
+
+    logger.info(
+        "Warm start: weights loaded from '%s'  "
+        "(original run: step=%s  epoch=%s  best_bleu=%.2f).  "
+        "All training state reset to zero.",
+        path, src_step, src_epoch, src_bleu,
+    )
+
+    return src_config
+
+
 def _prune_checkpoints(ckpt_dir: Path, keep: int) -> None:
     """
     Delete oldest epoch checkpoints, keeping only the `keep` most recent.
@@ -149,25 +251,40 @@ class Trainer:
 
     Parameters
     ----------
-    config    : dict                  Full Hydra config.
-    model     : Transformer
-    tokenizer : MultilingualTokenizer
-    train_loader : DataLoader         Token-bucket batched train set.
-    val_loader   : DataLoader         Validation set.
-    device    : str                   'cuda', 'mps', or 'cpu'.
-    resume_from : Path | None         Optional checkpoint to resume from.
+    config          : dict                  Full Hydra config.
+    model           : Transformer
+    tokenizer       : MultilingualTokenizer
+    train_loader    : DataLoader            Token-bucket batched train set.
+    val_loader      : DataLoader            Validation set.
+    device          : str                   'cuda', 'mps', or 'cpu'.
+    resume_from     : Path | None           Full resume (weights + optimizer
+                                            + step counter).  Use after crash.
+    warm_start_from : Path | None           Weights-only warm start.  Training
+                                            state resets to zero.  Mutually
+                                            exclusive with resume_from.
     """
 
     def __init__(
         self,
-        config:       dict,
-        model:        Transformer,
-        tokenizer:    MultilingualTokenizer,
-        train_loader: DataLoader,
-        val_loader:   DataLoader,
-        device:       str = "cuda",
-        resume_from:  Optional[Path] = None,
+        config:           dict,
+        model:            Transformer,
+        tokenizer:        MultilingualTokenizer,
+        train_loader:     DataLoader,
+        val_loader:       DataLoader,
+        device:           str = "cuda",
+        resume_from:      Optional[Path] = None,
+        warm_start_from:  Optional[Path] = None,
     ) -> None:
+
+        # Guard: both flags set at once is almost certainly a mistake
+        if resume_from is not None and warm_start_from is not None:
+            raise ValueError(
+                "resume_from and warm_start_from are mutually exclusive. "
+                "Use resume_from to continue a run after a crash, or "
+                "warm_start_from to start fresh from pre-trained weights — "
+                "never both at the same time."
+            )
+
         self.config     = config
         self.model      = model.to(device)
         self.tokenizer  = tokenizer
@@ -205,7 +322,7 @@ class Trainer:
         self.use_amp   = train_cfg["use_amp"] and device == "cuda"
         self.scaler    = GradScaler("cuda") if self.use_amp else None
 
-        # --- Training state ---
+        # --- Training state (may be overridden by resume_from below) ---
         self.global_step  = 0
         self.start_epoch  = 0
         self.best_bleu    = 0.0
@@ -224,16 +341,64 @@ class Trainer:
         # --- Wandb (optional) ---
         self._init_wandb()
 
-        # --- Resume from checkpoint ---
+        # ------------------------------------------------------------------
+        # Checkpoint loading — mutually exclusive branches
+        # ------------------------------------------------------------------
+
         if resume_from is not None:
+            # Full resume: weights + optimizer + scheduler + counters.
+            # The training curve is unbroken — useful after crashes.
             self.global_step, self.start_epoch, self.best_bleu = load_checkpoint(
-                resume_from, self.model, self.optimizer, self.scheduler, self.scaler, device
+                resume_from,
+                self.model,
+                self.optimizer,
+                self.scheduler,
+                self.scaler,
+                device,
             )
-            self.start_epoch += 1   # resume AFTER the saved epoch
+            # Advance start_epoch by 1: we resume AFTER the saved epoch
+            self.start_epoch += 1
+            logger.info(
+                "Full resume from '%s' — continuing at epoch=%d  step=%d",
+                resume_from, self.start_epoch, self.global_step,
+            )
+
+        elif warm_start_from is not None:
+            # Warm start: weights only — all training state stays at zero.
+            # The Noam LR schedule begins its warmup from step 0, the optimizer
+            # has no momentum memory, and epoch counting starts from 0.
+            src_config = load_weights_only(
+                warm_start_from,
+                self.model,
+                device=device,
+                strict=self.config["Training"].get("warm_start_strict", True),
+            )
+            # Sanity-check: warn if the source model had a different vocab size,
+            # since mismatched embedding tables mean the weights for the
+            # projection layer are shape-incompatible (load_state_dict would
+            # have already raised if strict=True, but a clear log is helpful).
+            src_vocab = src_config.get("Modelling", {}).get("tgt_vocab_size")
+            cur_vocab = model_cfg["tgt_vocab_size"]
+            if src_vocab and src_vocab != cur_vocab:
+                logger.warning(
+                    "Warm start vocab mismatch: source checkpoint has "
+                    "vocab_size=%d but current config has %d.  "
+                    "If strict=True this would have raised already.  "
+                    "If strict=False, the embedding/projection layers "
+                    "are randomly initialised for the new vocab positions.",
+                    src_vocab, cur_vocab,
+                )
+            logger.info(
+                "Warm start complete — training state is fresh "
+                "(epoch=0, step=0, best_bleu=0.0).",
+            )
+            # self.global_step / start_epoch / best_bleu remain 0 — by design
 
         logger.info(
-            "Trainer ready | device=%s  amp=%s  grad_accum=%d  max_epochs=%d",
-            device, self.use_amp, self.grad_accum, self.max_epochs,
+            "Trainer ready | device=%s  amp=%s  grad_accum=%d  "
+            "start_epoch=%d  start_step=%d  max_epochs=%d",
+            device, self.use_amp, self.grad_accum,
+            self.start_epoch, self.global_step, self.max_epochs,
         )
 
     # ------------------------------------------------------------------
@@ -275,10 +440,6 @@ class Trainer:
     # Single training step
     # ------------------------------------------------------------------
 
-    # ------------------------------------------------------------------
-    # NaN diagnosis helper  (remove once training is stable)
-    # ------------------------------------------------------------------
-
     def _check_nan(self, name: str, tensor: torch.Tensor) -> bool:
         """
         Return True and log a detailed report if `tensor` contains NaN or Inf.
@@ -314,12 +475,6 @@ class Trainer:
         tgt_in  = batch["tgt_in"].to(self.device)
         tgt_out = batch["tgt_out"].to(self.device)
 
-        # ------------------------------------------------------------------ #
-        # Stage 0 — sanity-check the raw batch tokens                        #
-        # ------------------------------------------------------------------ #
-        # Token ids should never be NaN (they are integers), but out-of-range
-        # ids (>= vocab_size) will silently produce garbage embeddings, so we
-        # check bounds here.
         vocab_size = self.config["Modelling"]["src_vocab_size"]
         if (src >= vocab_size).any() or (src < 0).any():
             logger.error(
@@ -332,8 +487,6 @@ class Trainer:
                 tgt_in.min().item(), tgt_in.max().item(), vocab_size,
             )
 
-        # Check if the entire target is padding (n_tokens == 0 in the loss
-        # denominator → 0/0 = NaN even with .clamp(min=1) if sum is also 0).
         n_real_tgt_tokens = (tgt_out != self.tokenizer.pad_id).sum().item()
         if n_real_tgt_tokens == 0:
             logger.error(
@@ -343,13 +496,9 @@ class Trainer:
                 self.global_step, tuple(src.shape), tuple(tgt_out.shape),
             )
 
-        # Build masks
         src_mask = Transformer.make_src_mask(src, self.tokenizer.pad_id)
         tgt_mask = Transformer.make_tgt_mask(tgt_in, self.tokenizer.pad_id)
 
-        # ------------------------------------------------------------------ #
-        # Stage 1 — embeddings                                               #
-        # ------------------------------------------------------------------ #
         src_emb = self.model.positional_encoding(
             self.model.embedded_enc(src) * math.sqrt(self.model.d_model)
         )
@@ -361,20 +510,14 @@ class Trainer:
             self._check_nan("tgt_embedding", tgt_emb)
         )
 
-        # ------------------------------------------------------------------ #
-        # Stage 2 — encoder layers                                           #
-        # ------------------------------------------------------------------ #
         enc_out = src_emb
         nan_in_enc = False
         for i, enc_layer in enumerate(self.model.encoder_layers):
             enc_out = enc_layer(enc_out, src_mask)
             if self._check_nan(f"encoder_layer_{i}_output", enc_out):
                 nan_in_enc = True
-                break   # first bad layer is the root cause; no need to go further
+                break
 
-        # ------------------------------------------------------------------ #
-        # Stage 3 — decoder layers                                           #
-        # ------------------------------------------------------------------ #
         dec_out = tgt_emb
         nan_in_dec = False
         for i, dec_layer in enumerate(self.model.decoder_layers):
@@ -383,9 +526,6 @@ class Trainer:
                 nan_in_dec = True
                 break
 
-        # ------------------------------------------------------------------ #
-        # Stage 4 — output projection + loss                                 #
-        # ------------------------------------------------------------------ #
         logits = self.model.out(dec_out)
         self._check_nan("logits", logits)
 
@@ -395,9 +535,6 @@ class Trainer:
         )
         self._check_nan("loss", raw_loss.unsqueeze(0))
 
-        # If anything was NaN, log the model weight norms so we can tell
-        # whether the weights themselves have exploded (indicates a previous
-        # bad optimizer step that gradient clipping didn't catch).
         if any([nan_in_emb, nan_in_enc, nan_in_dec,
                 not math.isfinite(raw_loss.item())]):
             for name, param in self.model.named_parameters():
@@ -410,9 +547,6 @@ class Trainer:
                             name, pnorm, gnorm,
                         )
 
-        # ------------------------------------------------------------------ #
-        # Backward (same as normal — NaN grads will be visible next step)    #
-        # ------------------------------------------------------------------ #
         scaled_loss = raw_loss / self.grad_accum
         if self.scaler:
             self.scaler.scale(scaled_loss).backward()
@@ -430,20 +564,10 @@ class Trainer:
         """
         Run greedy-decode on the validation set and compute BLEU per language pair.
 
-        Speed notes:
-            • Greedy decode is O(max_decode_steps) sequential forward passes per
-              batch, vs O(1) for training.  We cap at MAX_VAL_BATCHES so the
-              validation wall-clock stays proportional to training time.
-            • max_dec_len is capped to src_len + 50 instead of the full 200 —
-              this alone gives a 3–5× speedup on short sentences because most
-              real translations are not much longer than their source.
-
         Returns
         -------
         dict mapping "bleu/{src}-{tgt}" → float
         """
-        # Cap so validation never takes longer than a fraction of training time.
-        # 200 batches gives a stable corpus BLEU estimate; increase for final eval.
         MAX_VAL_BATCHES = 500
 
         self.model.eval()
@@ -463,8 +587,6 @@ class Trainer:
 
             src_mask = Transformer.make_src_mask(src, self.tokenizer.pad_id)
 
-            # Adaptive decode length: source length + slack, never exceeding config cap.
-            # Avoids running 200 decode steps for a 10-token source sentence.
             src_len     = src.size(1)
             max_dec_len = min(
                 src_len + 50,
@@ -488,6 +610,7 @@ class Trainer:
                 ref = ref_texts[i]
                 hyp_by_pair.setdefault(pair_key, []).append(hyp)
                 ref_by_pair.setdefault(pair_key, []).append([ref])
+
         bleu_scores: Dict[str, float] = {}
         for pair_key in hyp_by_pair:
             bleu = compute_corpus_bleu(hyp_by_pair[pair_key], ref_by_pair[pair_key], pair_key)
@@ -522,39 +645,30 @@ class Trainer:
 
         for epoch in range(self.start_epoch, self.max_epochs):
             epoch_loss   = 0.0
-            epoch_steps  = 0    # counts actual optimizer steps (not micro-batches)
+            epoch_steps  = 0
             epoch_tokens = 0
             t0 = time.time()
 
             for step_in_epoch, batch in enumerate(self.train_loader):
 
-                # ---- Forward + backward ----
                 loss = self._train_step(batch)
 
-                # Guard: a NaN/Inf loss (e.g. from an all-padding batch or AMP
-                # underflow) would silently poison every subsequent avg_loss
-                # computation via float addition.  Skip the accumulation and
-                # warn so the problem is visible in the logs.
                 if math.isfinite(loss):
                     epoch_loss += loss
                 else:
                     logger.warning(
                         "Non-finite loss (%.4g) at epoch=%d micro_step=%d — "
-                        "skipping accumulation.  Check for all-padding batches "
-                        "or AMP underflow.",
+                        "skipping accumulation.",
                         loss, epoch, step_in_epoch,
                     )
 
                 epoch_tokens += batch["src"].numel() + batch["tgt_in"].numel()
 
-                # ---- Optimizer step (every grad_accum micro-batches) ----
                 micro_step = (step_in_epoch + 1)
                 if micro_step % self.grad_accum == 0:
-                    # Unscale before clipping so the clip threshold is in fp32
                     if self.scaler:
                         self.scaler.unscale_(self.optimizer)
 
-                    # Gradient clipping — prevents rare exploding-gradient spikes
                     nn.utils.clip_grad_norm_(
                         self.model.parameters(), self.max_grad_norm
                     )
@@ -565,13 +679,11 @@ class Trainer:
                     else:
                         self.optimizer.step()
 
-                    # Noam schedule: one step per optimizer update (not per epoch)
                     self.scheduler.step()
                     self.optimizer.zero_grad()
                     self.global_step += 1
-                    epoch_steps      += 1  # track denominator for avg_loss
+                    epoch_steps      += 1
 
-                    # ---- Logging ----
                     if self.global_step % self.log_every == 0:
                         current_lr = self.scheduler.get_last_lr()[0]
                         logger.info(
@@ -584,13 +696,11 @@ class Trainer:
                             "train/epoch": epoch,
                         })
 
-                    # Hard step ceiling
                     if self.global_step >= self.max_steps:
                         logger.info("Reached max_steps=%d — stopping.", self.max_steps)
                         self._end_of_epoch(epoch, epoch_loss, epoch_steps, epoch_tokens, t0)
                         return
 
-            # ---- End of epoch ----
             self._end_of_epoch(epoch, epoch_loss, epoch_steps, epoch_tokens, t0)
 
         logger.info("=== Training complete ===")
@@ -601,15 +711,12 @@ class Trainer:
         self,
         epoch:        int,
         epoch_loss:   float,
-        epoch_steps:  int,    # actual optimizer steps this epoch (not micro-batches)
+        epoch_steps:  int,
         epoch_tokens: int,
         t0:           float,
     ) -> None:
         """Validation, BLEU logging, and checkpointing at epoch end."""
         elapsed   = time.time() - t0
-        # Divide by steps taken, not by len(train_loader) — the token-bucket
-        # DataLoader's __len__ is unreliable (may return 0 or raise) because
-        # the number of batches is only known after iterating the sampler.
         avg_loss  = epoch_loss / max(len(self.train_loader), 1)
         tok_per_s = epoch_tokens / max(elapsed, 1e-6)
 
@@ -618,7 +725,6 @@ class Trainer:
             epoch, avg_loss, tok_per_s, elapsed,
         )
 
-        # Validation + BLEU
         if (epoch + 1) % self.eval_every_epoch == 0:
             bleu_scores = self._validate(epoch)
             mean_bleu   = sum(bleu_scores.values()) / max(len(bleu_scores), 1)
@@ -629,7 +735,6 @@ class Trainer:
                 **bleu_scores,
             })
 
-            # Save best-BLEU checkpoint
             if mean_bleu > self.best_bleu:
                 self.best_bleu = mean_bleu
                 save_checkpoint(
@@ -641,7 +746,6 @@ class Trainer:
                 )
                 logger.info("  ★ New best BLEU: %.2f", self.best_bleu)
 
-        # Rolling epoch checkpoint
         if (epoch + 1) % self.save_every_epoch == 0:
             save_checkpoint(
                 path=self.ckpt_dir / f"epoch_{epoch:03d}.pt",

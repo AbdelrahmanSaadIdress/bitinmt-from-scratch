@@ -12,35 +12,46 @@ Usage (default — full config from configs/base.yaml):
 Usage (override any config key at the CLI via Hydra):
     python main.py Training.max_steps=500
 
-Usage (resume from a checkpoint):
+Usage (resume from a checkpoint — full state restore):
     python main.py +resume_from=checkpoints/epoch_002.pt
+
+Usage (warm start — load weights only, reset all training state):
+    python main.py +warm_start_from=checkpoints/best_bleu.pt
+
+Checkpoint loading modes
+-------------------------
+    resume_from
+        Full resume: restores model weights, optimizer state, scheduler
+        state, global_step, and epoch counter.  Use after a crash or
+        pre-emption to continue exactly where training stopped.
+
+    warm_start_from
+        Weights-only warm start: loads the model weights from a previous
+        checkpoint but resets ALL training state to zero — fresh optimizer,
+        fresh Noam LR schedule beginning its warmup again, epoch=0.
+        Use this to:
+            • Fine-tune on a new language pair after pre-training
+            • Re-run training with a different hyperparameter config
+            • Transfer weights to a model with a different d_model / n_layers
+              (set Training.warm_start_strict=false in that case)
+
+    These two flags are mutually exclusive.  Passing both raises an error.
 
 Execution flow
 --------------
     1. Load or train SentencePiece tokenizer
-       ├── If <sp_model_path> exists  →  load it directly
-       └── If not  →  download a raw-text slice from OPUS, write it to
-                      data/raw/ (persistent — you can inspect it), then
-                      call MultilingualTokenizer.train()
-
     2. Build train / val / test TranslationDatasets
-       (downloads OPUS pairs via HuggingFace Datasets, tokenises, filters)
-
     3. Wrap each dataset in a token-bucket DataLoader
-
     4. Construct the Transformer model from config
-
     5. Hand everything to Trainer and call .train()
 
 Persistent files you will see after running
 -------------------------------------------
     data/
         raw/              ← raw .txt files used to train SentencePiece
-            en-ar.txt
-            en-fr.txt
         spm/
             multinmt.model   ← trained SentencePiece model
-            multinmt.vocab   ← human-readable vocabulary
+            multinmt.vocab
 
     checkpoints/
         best_bleu.pt      ← best checkpoint by validation BLEU
@@ -70,13 +81,11 @@ log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Smoke-test config overrides
-# Applied when you pass +smoke=true on the CLI.
-# These values make the run finish in ~10 minutes on a laptop GPU / CPU.
 # ---------------------------------------------------------------------------
 SMOKE_OVERRIDES = {
     "Data": {
-        "max_examples": 1_000,   # 1k sentence pairs total — tiny
-        "vocab_size":   4_000,   # small vocab trains SP in seconds
+        "max_examples": 1_000,
+        "vocab_size":   4_000,
     },
     "Modelling": {
         "d_model":     128,
@@ -84,16 +93,15 @@ SMOKE_OVERRIDES = {
         "num_layers":    2,
         "d_ff":        256,
         "dropout":     0.1,
-        # src/tgt vocab sizes synced from tokenizer after training
     },
     "Training": {
-        "batch_size":        512,   # tokens per batch
+        "batch_size":        512,
         "warmup_steps":      100,
         "max_steps":         300,
-        "max_epochs":        999,   # stopped by max_steps
+        "max_epochs":        999,
         "eval_every_n_epochs": 1,
         "log_every_n_steps":  20,
-        "use_amp":          False,  # no AMP on CPU
+        "use_amp":          False,
     },
     "Wandb": {
         "project": "multinmt-smoke",
@@ -126,11 +134,7 @@ def detect_device() -> str:
 
 
 def apply_smoke_overrides(config: dict) -> dict:
-    """
-    Deep-merge SMOKE_OVERRIDES into config.
-    Only touches the keys listed in SMOKE_OVERRIDES — everything else is
-    preserved from base.yaml.
-    """
+    """Deep-merge SMOKE_OVERRIDES into config."""
     for section, values in SMOKE_OVERRIDES.items():
         if section not in config:
             config[section] = {}
@@ -146,18 +150,13 @@ def collect_raw_text_for_sp(
 ) -> List[str]:
     """
     Download a slice of each OPUS pair, write one .txt file per language to
-    `raw_dir` (persistent — survives the run), and return the file paths for
-    SentencePiece training.
-
-    Why separate files per language (not per pair)?
-        Each language contributes roughly equal text volume, preventing
-        high-resource languages from dominating the shared BPE vocabulary.
+    `raw_dir` (persistent), and return the file paths for SentencePiece training.
 
     Parameters
     ----------
     config               : dict   Full config.
-    raw_dir              : Path   Where to write the .txt files.  Created if absent.
-    max_examples_per_pair: int    Lines-per-pair cap.  Use a small value for smoke tests.
+    raw_dir              : Path   Where to write the .txt files.
+    max_examples_per_pair: int    Lines-per-pair cap.
 
     Returns
     -------
@@ -166,7 +165,7 @@ def collect_raw_text_for_sp(
     raw_dir.mkdir(parents=True, exist_ok=True)
     data_cfg = config["Data"]
 
-    lang_sentences: dict[str, list] = {}   # lang_code → [sentences]
+    lang_sentences: dict[str, list] = {}
 
     for pair_cfg in data_cfg["pairs"]:
         src_lang = pair_cfg["src"]
@@ -178,7 +177,7 @@ def collect_raw_text_for_sp(
                 src_lang, tgt_lang,
                 split="train",
                 cache_dir=str(raw_dir),
-                also_reverse=False,          # no need to duplicate for SP vocab
+                also_reverse=False,
                 max_examples=1000000,
             )
         except Exception as exc:
@@ -195,7 +194,6 @@ def collect_raw_text_for_sp(
             "Check your Data.pairs config and internet connection."
         )
 
-    # Write one file per language — these are PERSISTENT files you can open
     output_files: List[str] = []
     for lang, sentences in sorted(lang_sentences.items()):
         fpath = raw_dir / f"raw_{lang}.txt"
@@ -219,37 +217,26 @@ def main(cfg: DictConfig) -> None:
     # ------------------------------------------------------------------ #
     config = OmegaConf.to_container(cfg, resolve=True)
 
-    # Apply smoke overrides if +smoke=true was passed on CLI
     if cfg.get("smoke", False):
         config = apply_smoke_overrides(config)
 
     set_seed(config["Training"]["seed"])
     device = detect_device()
 
-    # Disable AMP automatically when on CPU (AMP is CUDA-only)
     if device == "cpu":
         config["Training"]["use_amp"] = False
 
     log.info("\n%s", OmegaConf.to_yaml(cfg))
 
-    # Resolve all persistent directory paths relative to the project root.
-    # Hydra changes cwd to outputs/<date>/<time>/ — we use the original
-    # working directory (stored by Hydra as hydra.runtime.cwd) to keep
-    # data/ and checkpoints/ at the project root, not buried in outputs/.
     try:
         project_root = Path(hydra.utils.get_original_cwd())
     except Exception:
         project_root = Path.cwd()
 
-    def abs_path(p: str) -> Path:
-        """Make a config path absolute relative to project root."""
-        return (project_root / p).resolve()
-
     raw_dir  = Path(config["Data"]["raw_dir"])
     sp_path  = Path(config["Data"]["sp_model_path"])
     ckpt_dir = Path(config["Training"]["checkpoint_dir"])
 
-    # Write resolved paths back into config so downstream modules use them
     config["Data"]["raw_dir"]             = str(raw_dir)
     config["Data"]["sp_model_path"]       = str(sp_path)
     config["Training"]["checkpoint_dir"]  = str(ckpt_dir)
@@ -258,6 +245,38 @@ def main(cfg: DictConfig) -> None:
     log.info("Raw data dir  : %s", raw_dir)
     log.info("SP model path : %s", sp_path)
     log.info("Checkpoint dir: %s", ckpt_dir)
+
+    # ------------------------------------------------------------------ #
+    # 0b.  Validate checkpoint flags (mutual exclusion)                  #
+    # ------------------------------------------------------------------ #
+    raw_resume     = cfg.get("resume_from",     None)
+    raw_warm_start = cfg.get("warm_start_from", None)
+
+    if raw_resume and raw_warm_start:
+        raise ValueError(
+            "Cannot use +resume_from and +warm_start_from together.\n"
+            "  +resume_from     → full resume (weights + optimizer + step)\n"
+            "  +warm_start_from → weights only, training state resets to zero\n"
+            "Pick one."
+        )
+
+    resume_from:     Optional[Path] = None
+    warm_start_from: Optional[Path] = None
+
+    if raw_resume:
+        resume_from = Path(str(raw_resume))
+        if not resume_from.exists():
+            raise FileNotFoundError(f"resume_from checkpoint not found: {resume_from}")
+        log.info("Mode: full resume from '%s'", resume_from)
+
+    if raw_warm_start:
+        warm_start_from = Path(str(raw_warm_start))
+        if not warm_start_from.exists():
+            raise FileNotFoundError(f"warm_start_from checkpoint not found: {warm_start_from}")
+        log.info(
+            "Mode: warm start from '%s' — weights loaded, training state reset to zero.",
+            warm_start_from,
+        )
 
     # ------------------------------------------------------------------ #
     # 1.  Tokenizer                                                       #
@@ -275,12 +294,12 @@ def main(cfg: DictConfig) -> None:
         raw_files = collect_raw_text_for_sp(
             config,
             raw_dir=raw_dir,
-            max_examples_per_pair=max_examples ,
+            max_examples_per_pair=max_examples,
         )
 
         tokenizer = MultilingualTokenizer.train(
             input_files=raw_files,
-            model_prefix=sp_path.with_suffix(""),   # SP appends .model itself
+            model_prefix=sp_path.with_suffix(""),
             vocab_size=config["Data"]["vocab_size"],
             character_coverage=config["Data"]["character_coverage"],
             model_type=config["Data"]["sp_model_type"],
@@ -319,7 +338,6 @@ def main(cfg: DictConfig) -> None:
     # ------------------------------------------------------------------ #
     # 3.  DataLoaders                                                     #
     # ------------------------------------------------------------------ #
-    # num_workers=0 on CPU avoids multiprocessing overhead for small runs
     num_workers = 0 if device == "cpu" else 4
 
     train_loader = build_dataloader(
@@ -345,7 +363,6 @@ def main(cfg: DictConfig) -> None:
     # ------------------------------------------------------------------ #
     # 4.  Model                                                           #
     # ------------------------------------------------------------------ #
-    # Always sync vocab sizes from the actual trained SP model
     config["Modelling"]["src_vocab_size"] = tokenizer.vocab_size
     config["Modelling"]["tgt_vocab_size"] = tokenizer.vocab_size
 
@@ -354,18 +371,7 @@ def main(cfg: DictConfig) -> None:
     log.info("Model: %.2fM trainable parameters", n_params / 1e6)
 
     # ------------------------------------------------------------------ #
-    # 5.  Optional resume                                                 #
-    # ------------------------------------------------------------------ #
-    resume_from: Optional[Path] = None
-    raw_resume = cfg.get("resume_from", None)
-    if raw_resume:
-        resume_from = Path(str(raw_resume))
-        if not resume_from.exists():
-            raise FileNotFoundError(f"Checkpoint not found: {resume_from}")
-        log.info("Resuming from: %s", resume_from)
-
-    # ------------------------------------------------------------------ #
-    # 6.  Train                                                           #
+    # 5.  Train                                                           #
     # ------------------------------------------------------------------ #
     trainer = Trainer(
         config=config,
@@ -375,6 +381,7 @@ def main(cfg: DictConfig) -> None:
         val_loader=val_loader,
         device=device,
         resume_from=resume_from,
+        warm_start_from=warm_start_from,
     )
 
     trainer.train()

@@ -526,7 +526,7 @@ def build_datasets(
                     src_lang, tgt_lang,
                     split=split,
                     cache_dir=data_cfg.get("raw_dir"),
-                    also_reverse=False,
+                    also_reverse=True,
                     max_examples=max_examples,
                     ratios=[data_cfg["train_ratio"], data_cfg["val_ratio"], data_cfg["test_ratio"]],
                 )

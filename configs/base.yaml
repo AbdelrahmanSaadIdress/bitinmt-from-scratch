@@ -54,12 +54,12 @@ Data:
 Modelling:
   src_vocab_size: 16000         # must match Data.vocab_size after SP training
   tgt_vocab_size: 16000         # shared vocab → same value
-  d_model:        512           # embedding / hidden dimension
-  num_heads:        8           # attention heads  (d_model / num_heads = 64 = d_k)
-  num_layers:       6           # encoder layers = decoder layers
-  d_ff:           2048          # position-wise FFN inner dimension (paper: 4 * d_model)
+  d_model:        256           # embedding / hidden dimension
+  num_heads:        4           # attention heads  (d_model / num_heads = 64 = d_k)
+  num_layers:       4           # encoder layers = decoder layers
+  d_ff:           1024          # position-wise FFN inner dimension (paper: 4 * d_model)
   max_seq_length:  150          # must match Data.max_seq_length
-  dropout:         0.1          # applied to embeddings + sub-layer outputs (Section 5.4)
+  dropout:         0.15          # applied to embeddings + sub-layer outputs (Section 5.4)
 
 # ---------------------------------------------------------------------------
 # Training  (paper Section 5.3 — Optimizer)
@@ -80,13 +80,34 @@ Training:
 
   batch_size:     4096         # tokens per batch (paper trains on ~25k tokens/batch)
                                # set lower if VRAM is limited; trainer will accumulate
-  grad_accum_steps: 2          # increase to simulate larger batch on small GPU
+  grad_accum_steps: 4          # increase to simulate larger batch on small GPU
 
-  max_epochs:      120
-  max_steps:    100000         # hard stop regardless of epochs
+  max_epochs:      250
+  max_steps:    2000000000           # hard stop regardless of epochs
 
   # Mixed precision — "beyond the paper" speedup, harmless to faithfulness
   use_amp:        true         # torch.cuda.amp  (set false on CPU / MPS)
+
+  # ---------------------------------------------------------------------------
+  # Warm start (weights-only loading)
+  # ---------------------------------------------------------------------------
+  # Controls whether load_state_dict is called with strict=True when using
+  # +warm_start_from on the CLI.
+  #
+  # strict: true  (default)
+  #   The checkpoint's state-dict keys must match the current model exactly.
+  #   Use this when the architecture is identical to the source checkpoint —
+  #   it will raise immediately if there is any mismatch, which is the safest
+  #   behaviour.
+  #
+  # strict: false
+  #   Keys present in the checkpoint but not in the model are ignored.
+  #   Keys present in the model but not in the checkpoint are left at their
+  #   random PyTorch initialisation.
+  #   Use this when transferring weights to a model with extra layers, a new
+  #   language embedding, or a different output projection (e.g. you have
+  #   added <ar> and retrained the tokenizer with a larger vocab_size).
+  warm_start_strict: true
 
   # Checkpointing
   checkpoint_dir:   checkpoints/
@@ -96,7 +117,7 @@ Training:
 
   # Logging / eval cadence
   log_every_n_steps:    100
-  eval_every_n_epochs:    10
+  eval_every_n_epochs:    5
   seed:                  42
 
 # ---------------------------------------------------------------------------
