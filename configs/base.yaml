@@ -133,7 +133,7 @@ Evaluation:
 # Experiment Tracking (wandb)
 # ---------------------------------------------------------------------------
 Wandb:
-  project:  multinmt-from-scratch
+  project:  bitinmt-from-scratch
   entity:   ""                 # set to your wandb username / team
   log_attention_every_n_steps: 500
   attention_sample_sentence: "The model learns to translate between languages."
